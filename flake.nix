@@ -46,7 +46,7 @@
           pname = "ui";
           version = "0.0.0";
           src = ./ui;
-          npmDepsHash = "sha256-Q7AVCPU+rZhsMRts3Sn/P2G22pePOI0BAnMrcXkUgUo=";
+          npmDepsHash = "sha256-Tu4ANFEne0eV2E6JEnRTz6PKh9TdPX6GL5HfIwAV3q0=";
           installPhase = ''
             cp -pr --reflink=auto -- dist "$out/"
           '';
@@ -90,6 +90,9 @@
 
             pkgs.httpie
             pkgs.sqlite
+
+            pkgs.openssl
+            pkgs.pkg-config
           ];
         };
 

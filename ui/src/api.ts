@@ -1,12 +1,26 @@
 import { z } from "zod";
 import { createZodFetcher } from "zod-fetch";
 
-const BASE_URL = import.meta.env.PROD ? "/api" : "http://localhost:3030/api";
+let basePath = document.querySelector<HTMLMetaElement>(
+  `meta[name="BASE_PATH"]`,
+);
+const BASE_URL = import.meta.env.PROD
+  ? basePath
+    ? `${basePath.content}/api`
+    : "/api"
+  : "http://localhost:3030/api";
+
+const counts = z
+  .object({
+    name: z.string(),
+    count: z.number(),
+  })
+  .array();
 
 const overview = z.object({
   file_name: z.string(),
   sqlite_version: z.string().nullable(),
-  file_size: z.string(),
+  db_size: z.string(),
   created: z
     .string()
     .datetime()
@@ -21,21 +35,13 @@ const overview = z.object({
   indexes: z.number(),
   triggers: z.number(),
   views: z.number(),
-  counts: z
-    .object({
-      name: z.string(),
-      count: z.number(),
-    })
-    .array(),
+  row_counts: counts,
+  column_counts: counts,
+  index_counts: counts,
 });
 
 const tables = z.object({
-  tables: z
-    .object({
-      name: z.string(),
-      count: z.number(),
-    })
-    .array(),
+  tables: counts,
 });
 
 const table = z.object({
@@ -57,6 +63,10 @@ const query = z.object({
   rows: z.any().array().array(),
 });
 
+const version = z.object({
+  version: z.string(),
+});
+
 const $fetch = createZodFetcher();
 
 export const fetchOverview = () => $fetch(overview, `${BASE_URL}/`);
@@ -74,3 +84,4 @@ export const fetchQuery = (value: string) =>
     },
     body: JSON.stringify({ query: value }),
   });
+export const fetchVersion = () => $fetch(version, `${BASE_URL}/version`);
