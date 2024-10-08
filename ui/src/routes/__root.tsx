@@ -1,7 +1,23 @@
-import { Link, Outlet, createRootRoute } from "@tanstack/react-router";
-import { Moon, Sun } from "lucide-react";
 import React from "react";
+import { Moon, Sun, Power } from "lucide-react";
+import { useQuery } from "@tanstack/react-query";
+import { Link, Outlet, createRootRoute } from "@tanstack/react-router";
 
+import { cn } from "@/lib/utils";
+import { fetchMetadata, sendShutdown } from "@/api";
+import { setTheme, useTheme } from "@/provider/theme.provider";
+
+import {
+  AlertDialog,
+  AlertDialogTitle,
+  AlertDialogCancel,
+  AlertDialogAction,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogContent,
+  AlertDialogTrigger,
+  AlertDialogDescription,
+} from "@/components/ui/alert-dialog";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -10,10 +26,6 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { cn } from "@/lib/utils";
-import { setTheme, useTheme } from "@/provider/theme.provider";
-import { useQuery } from "@tanstack/react-query";
-import { fetchVersion } from "@/api";
 
 const TanStackRouterDevtools = import.meta.env.PROD
   ? () => null // Render nothing in production
@@ -34,8 +46,8 @@ export function Root() {
   const changeTheme = setTheme();
 
   const { data } = useQuery({
-    queryKey: ["version"],
-    queryFn: () => fetchVersion(),
+    queryKey: ["metadata"],
+    queryFn: () => fetchMetadata(),
   });
 
   return (
@@ -82,6 +94,7 @@ export function Root() {
             <p className="text-primary hidden sm:block text-xs text-right">
               [{data?.version ?? ""}]
             </p>
+            {data?.can_shutdown && <Shutdown />}
             <button
               className="text-foreground "
               onClick={() => {
@@ -115,6 +128,41 @@ export function Root() {
       </div>
       <TanStackRouterDevtools />
     </>
+  );
+}
+
+function Shutdown() {
+  const currentTheme = useTheme();
+
+  return (
+    <AlertDialog>
+      <AlertDialogTrigger className="text-foreground">
+        <Power
+          size={28}
+          className="bg-primary/20 text-primary rounded-full p-1"
+        />
+      </AlertDialogTrigger>
+      <AlertDialogContent className={`sm:max-w-[450px] ${currentTheme}`}>
+        <AlertDialogHeader>
+          <AlertDialogTitle className="text-primary">
+            Do you really want to shutdown?
+          </AlertDialogTitle>
+          <AlertDialogDescription>
+            Send a signal to the server telling it to shutdown.
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogCancel>Cancel</AlertDialogCancel>
+          <AlertDialogAction
+            onClick={() => {
+              sendShutdown();
+            }}
+          >
+            Shutdown
+          </AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
   );
 }
 

@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use clap::{Parser, Subcommand};
+use tokio::sync::mpsc;
 use warp::Filter;
 
 const ROWS_PER_PAGE: i32 = 50;
@@ -22,6 +23,14 @@ struct Args {
     /// Base path to be provided to the UI. [e.g /sql-studio]
     #[clap(short, long)]
     base_path: Option<String>,
+
+    /// Don't open URL in the system browser.
+    #[clap(long)]
+    no_browser: bool,
+
+    /// Don't show the shutdown button in the UI.
+    #[clap(long)]
+    no_shutdown: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -44,8 +53,12 @@ enum Command {
 
     /// A PostgreSQL database.
     Postgres {
-        /// postgresql connection url [postgresql://postgres:postgres@127.0.0.1/sample]
+        /// PostgreSQL connection url [postgresql://postgres:postgres@127.0.0.1/sample]
         url: String,
+
+        /// PostgreSQL schema
+        #[arg(short, long, default_value = "public")]
+        schema: String,
     },
 
     /// A MySQL/MariaDB database.
@@ -100,8 +113,8 @@ async fn main() -> color_eyre::Result<()> {
         Command::Libsql { url, auth_token } => {
             AllDbs::Libsql(libsql::Db::open(url, auth_token, args.timeout.into()).await?)
         }
-        Command::Postgres { url } => {
-            AllDbs::Postgres(postgres::Db::open(url, args.timeout.into()).await?)
+        Command::Postgres { url, schema } => {
+            AllDbs::Postgres(postgres::Db::open(url, schema, args.timeout.into()).await?)
         }
         Command::Mysql { url } => AllDbs::Mysql(mysql::Db::open(url, args.timeout.into()).await?),
         Command::Duckdb { database } => {
@@ -128,7 +141,9 @@ async fn main() -> color_eyre::Result<()> {
         .allow_methods(vec!["GET", "POST", "DELETE"])
         .allow_headers(vec!["Content-Length", "Content-Type"]);
 
-    let api = warp::path("api").and(handlers::routes(db));
+    let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
+
+    let api = warp::path("api").and(handlers::routes(db, args.no_shutdown, shutdown_tx));
     let homepage = statics::homepage(index_html.clone());
     let statics = statics::routes();
 
@@ -138,13 +153,25 @@ async fn main() -> color_eyre::Result<()> {
         .recover(rejections::handle_rejection)
         .with(cors);
 
-    if args.base_path.is_none() {
+    if args.base_path.is_none() && !args.no_browser {
         let res = open::that(format!("http://{}", args.address));
         tracing::info!("tried to open in browser: {res:?}");
     }
 
     let address = args.address.parse::<std::net::SocketAddr>()?;
-    warp::serve(routes).run(address).await;
+    let (_, fut) = warp::serve(routes).bind_with_graceful_shutdown(address, async move {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                    println!();
+            }
+            _ = shutdown_rx.recv() => {
+                tracing::info!("received shutdown signal")
+            }
+        }
+    });
+
+    fut.await;
+    tracing::info!("shutting down...");
 
     Ok(())
 }
@@ -206,7 +233,6 @@ mod statics {
             .map(|file| {
                 Response::builder()
                     .header(CONTENT_TYPE, "text/html")
-                    .header(CACHE_CONTROL, "max-age=3600, must-revalidate")
                     .body(file)
                     .unwrap()
             })
@@ -1200,11 +1226,16 @@ mod postgres {
     #[derive(Clone)]
     pub struct Db {
         client: Arc<Client>,
+        schema: String,
         query_timeout: Duration,
     }
 
     impl Db {
-        pub async fn open(url: String, query_timeout: Duration) -> color_eyre::Result<Self> {
+        pub async fn open(
+            url: String,
+            schema: String,
+            query_timeout: Duration,
+        ) -> color_eyre::Result<Self> {
             let (client, connection) = tokio_postgres::connect(&url, NoTls).await?;
 
             // The connection object performs the actual communication with the database,
@@ -1217,12 +1248,14 @@ mod postgres {
 
             let tables: i64 = client
                 .query_one(
-                    r#"
+                    &format!(
+                        r#"
             SELECT count(*)
             FROM information_schema.tables
-            WHERE table_schema = 'public'
+            WHERE table_schema = '{schema}'
             AND table_type = 'BASE TABLE'
-                "#,
+                        "#
+                    ),
                     &[],
                 )
                 .await?
@@ -1234,6 +1267,7 @@ mod postgres {
             );
 
             Ok(Self {
+                schema,
                 query_timeout,
                 client: Arc::new(client),
             })
@@ -1243,6 +1277,8 @@ mod postgres {
     #[async_trait]
     impl Database for Db {
         async fn overview(&self) -> color_eyre::Result<responses::Overview> {
+            let schema = &self.schema;
+
             let file_name: String = self
                 .client
                 .query_one("SELECT current_database()", &[])
@@ -1262,12 +1298,14 @@ mod postgres {
             let tables: i64 = self
                 .client
                 .query_one(
-                    r#"
+                    &format!(
+                        r#"
             SELECT count(*)
             FROM information_schema.tables
-            WHERE table_schema = 'public'
+            WHERE table_schema = '{schema}'
             AND table_type = 'BASE TABLE'
-                "#,
+                        "#
+                    ),
                     &[],
                 )
                 .await?
@@ -1276,11 +1314,13 @@ mod postgres {
             let indexes: i64 = self
                 .client
                 .query_one(
-                    r#"
+                    &format!(
+                        r#"
             SELECT count(*) 
             FROM pg_indexes 
-            WHERE schemaname = 'public'
-                "#,
+            WHERE schemaname = '{schema}'
+                       "#
+                    ),
                     &[],
                 )
                 .await?
@@ -1289,11 +1329,13 @@ mod postgres {
             let triggers: i64 = self
                 .client
                 .query_one(
-                    r#"
+                    &format!(
+                        r#"
             SELECT count(*)
             FROM information_schema.triggers
-            WHERE trigger_schema = 'public'
-                "#,
+            WHERE trigger_schema = '{schema}'
+                        "#
+                    ),
                     &[],
                 )
                 .await?
@@ -1302,11 +1344,13 @@ mod postgres {
             let views: i64 = self
                 .client
                 .query_one(
-                    r#"
+                    &format!(
+                        r#"
             SELECT count(*)
             FROM information_schema.views
-            WHERE table_schema = 'public';
-                "#,
+            WHERE table_schema = '{schema}';
+                        "#
+                    ),
                     &[],
                 )
                 .await?
@@ -1315,11 +1359,13 @@ mod postgres {
             let mut row_counts = self
                 .client
                 .query(
-                    r#"
-            SELECT relname
-            FROM pg_stat_user_tables
-            WHERE schemaname = 'public'
-                "#,
+                    &format!(
+                        r#"
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = '{schema}'
+                        "#
+                    ),
                     &[],
                 )
                 .await?
@@ -1344,11 +1390,13 @@ mod postgres {
             let mut column_counts = self
                 .client
                 .query(
-                    r#"
-            SELECT relname
-            FROM pg_stat_user_tables
-            WHERE schemaname = 'public'
-                "#,
+                    &format!(
+                        r#"
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = '{schema}'
+                        "#
+                    ),
                     &[],
                 )
                 .await?
@@ -1367,7 +1415,7 @@ mod postgres {
                             r#"
                 SELECT count(*)
                 FROM information_schema.columns
-                WHERE table_schema = 'public'
+                WHERE table_schema = '{schema}'
                 AND table_name = '{}'
                             "#,
                             table.name
@@ -1385,11 +1433,13 @@ mod postgres {
             let mut index_counts = self
                 .client
                 .query(
-                    r#"
-            SELECT relname
-            FROM pg_stat_user_tables
-            WHERE schemaname = 'public'
-                "#,
+                    &format!(
+                        r#"
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = '{schema}'
+                        "#
+                    ),
                     &[],
                 )
                 .await?
@@ -1439,14 +1489,18 @@ mod postgres {
         }
 
         async fn tables(&self) -> color_eyre::Result<responses::Tables> {
+            let schema = &self.schema;
+
             let mut tables = self
                 .client
                 .query(
-                    r#"
-            SELECT relname
-            FROM pg_stat_user_tables
-            WHERE schemaname = 'public'
-                "#,
+                    &format!(
+                        r#"
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = '{schema}'
+                        "#
+                    ),
                     &[],
                 )
                 .await?
@@ -1472,6 +1526,8 @@ mod postgres {
         }
 
         async fn table(&self, name: String) -> color_eyre::Result<responses::Table> {
+            let schema = &self.schema;
+
             let row_count: i64 = self
                 .client
                 .query_one(&format!(r#"SELECT count(*) FROM "{name}""#), &[])
@@ -1507,7 +1563,7 @@ mod postgres {
                         r#"
             SELECT count(*)
             FROM information_schema.columns
-            WHERE table_schema = 'public'
+            WHERE table_schema = '{schema}'
             AND table_name = '{name}'
                         "#
                     ),
@@ -1531,13 +1587,17 @@ mod postgres {
             name: String,
             page: i32,
         ) -> color_eyre::Result<responses::TableData> {
+            let schema = &self.schema;
+
             let first_column: String = self
                 .client
                 .query_one(
                     &format!(
                         r#"
-            SELECT column_name FROM information_schema.columns
-            WHERE table_schema = 'public' AND table_name = '{name}'
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = '{schema}'
+            AND table_name = '{name}'
             LIMIT 1
                         "#
                     ),
@@ -2876,16 +2936,18 @@ mod responses {
     }
 
     #[derive(Serialize)]
-    pub struct Version {
+    pub struct Metadata {
         pub version: String,
+        pub can_shutdown: bool,
     }
 }
 
 mod handlers {
     use serde::Deserialize;
+    use tokio::sync::mpsc;
     use warp::Filter;
 
-    use crate::{rejections, responses::Version, Database};
+    use crate::{rejections, responses::Metadata, Database};
 
     fn with_state<T: Clone + Send>(
         state: &T,
@@ -2896,6 +2958,8 @@ mod handlers {
 
     pub fn routes(
         db: impl Database,
+        no_shutdown: bool,
+        shutdown_signal: mpsc::Sender<()>,
     ) -> impl Filter<Extract = (impl warp::Reply,), Error = warp::Rejection> + Clone {
         let overview = warp::path::end()
             .and(warp::get())
@@ -2919,9 +2983,23 @@ mod handlers {
             .and(warp::path!("query"))
             .and(warp::body::json::<QueryBody>())
             .and_then(query);
-        let version = warp::get().and(warp::path!("version")).and_then(version);
+        let metadata = warp::get()
+            .and(warp::path!("metadata"))
+            .and(warp::any().map(move || no_shutdown))
+            .and_then(metadata);
+        let shutdown = warp::post()
+            .and(warp::path!("shutdown"))
+            .and(with_state(&shutdown_signal))
+            .and(warp::any().map(move || no_shutdown))
+            .and_then(shutdown);
 
-        overview.or(tables).or(table).or(query).or(data).or(version)
+        overview
+            .or(tables)
+            .or(table)
+            .or(query)
+            .or(data)
+            .or(metadata)
+            .or(shutdown)
     }
 
     #[derive(Deserialize)]
@@ -2984,12 +3062,24 @@ mod handlers {
         Ok(warp::reply::json(&tables))
     }
 
-    async fn version() -> Result<impl warp::Reply, warp::Rejection> {
-        let version = Version {
+    async fn metadata(no_shutdown: bool) -> Result<impl warp::Reply, warp::Rejection> {
+        let version = Metadata {
             version: env!("CARGO_PKG_VERSION").to_owned(),
+            can_shutdown: !no_shutdown,
         };
 
         Ok(warp::reply::json(&version))
+    }
+
+    async fn shutdown(
+        shutdown_signal: mpsc::Sender<()>,
+        no_shutdown: bool,
+    ) -> Result<impl warp::Reply, warp::Rejection> {
+        if !no_shutdown {
+            let res = shutdown_signal.send(()).await;
+            tracing::info!("sent shutdown signal: {res:?}");
+        }
+        Ok("")
     }
 }
 
